@@ -1,0 +1,1584 @@
+================================================================================
+         UNIX DEV FULL DOCUMENT
+         ※このドキュメントはAIによる生成が含まれています。
+================================================================================
+
+著者向けメモ:
+  対象言語: C言語（一部アセンブリ）
+  対象アーキテクチャ: x86-64（AMD64）を主軸に説明
+  目標: POSIX準拠の Unix ライクなカーネルを0から作れるようになること
+
+================================================================================
+目次
+================================================================================
+
+  第0章  全体アーキテクチャの概観
+  第1章  ブートプロセス
+  第2章  メモリ管理
+  第3章  プロセス管理
+  第4章  スケジューラ
+  第5章  システムコール機構
+  第6章  割り込み・例外処理
+  第7章  仮想ファイルシステム（VFS）
+  第8章  デバイスドライバ基盤
+  第9章  プロセス間通信（IPC）
+  第10章 シグナル処理
+  第11章 ページキャッシュ・バッファキャッシュ
+  第12章 ネットワークスタック基礎
+  第13章 ユーザー空間との境界・セキュリティ
+
+================================================================================
+第0章  全体アーキテクチャの概観
+================================================================================
+
+【カーネルとは何か】
+
+  カーネルは「ハードウェアとユーザープログラムの間に立つ特権的なプログラム」である。
+  ユーザープログラムはCPUのリング3（非特権モード）で動き、カーネルはリング0（特権モード）で動く。
+  ユーザープログラムがハードウェアやOSのサービスを使いたいときは
+  必ずカーネルに「システムコール」という形で依頼しなければならない。
+
+【Unix の設計哲学がカーネル構造に与える影響】
+
+  1. "すべてはファイルである"
+     → デバイス・ソケット・パイプもファイルディスクリプタで表現する
+     → VFS（仮想ファイルシステム）という抽象層を作る必要がある
+
+  2. プロセスモデル
+     → fork() + exec() による生成
+     → 親子関係・プロセスグループ・セッションの管理が必要
+
+  3. パイプとシグナル
+     → プロセス間で非同期に通知できる仕組みが必要
+
+【カーネルの主要サブシステム一覧】
+
+  ┌─────────────────────────────────────────────┐
+  │           ユーザー空間プログラム                                                         │
+  └──────────────┬──────────────────────────────┘
+                 │ システムコール（INT 0x80 / SYSCALL命令）
+  ┌──────────────▼──────────────────────────────┐
+  │  システムコールディスパッチャ                                                            │
+  ├───────────────┬─────────┬───────────────────┤
+  │  プロセス  │  メモリ管理 │  ファイルシステム   │                                      │   
+  │  管理      │  (VMM)      │  (VFS)              │                                        │
+  ├───────────┼─────────────┼───────────────────┤
+  │  スケジュ  │  ページャ   │  デバイスドライバ │
+  │  ーラ     │  (swapper)  │  基盤             │
+  ├───────────┴─────────────┴───────────────────┤
+  │  割り込み/例外ハンドラ（IDT）               │
+  ├──────────────────────────────────────────────┤
+  │  ハードウェア抽象化層（HAL）                 │
+  └──────────────────────────────────────────────┘
+                 │
+  ┌──────────────▼──────────────────────────────┐
+  │           ハードウェア (CPU/RAM/Disk...)       │
+  └─────────────────────────────────────────────┘
+
+================================================================================
+第1章  ブートプロセス
+================================================================================
+
+【1-1. BIOSからカーネルまでの流れ】
+
+  電源投入後の流れ（レガシーBIOS の場合）:
+
+  [1] BIOS/UEFI が起動
+      → POST（Power On Self Test）でハードウェアチェック
+      → ブートデバイスの先頭512バイト（MBR）をアドレス 0x7C00 にロードして実行
+
+  [2] ステージ1ブートローダ（MBRコード、最大446バイト）
+      → ブートパーティションを見つける
+      → ステージ2ブートローダをロード（GRUBならcore.img）
+
+  [3] ステージ2ブートローダ（GRUB2 等）
+      → ファイルシステムを読めるようになる
+      → カーネルイメージ（vmlinuz等）をメモリにロード
+      → initrd（初期RAMディスク）をロード
+      → カーネルに制御を渡す（real modeで開始）
+
+  [4] カーネルのブートコード（arch/x86/boot/header.S 等に相当）
+      → real mode（16bit）で動作開始
+      → A20ラインを有効化（1MBを超えたメモリアクセスのため）
+      → GDT（グローバルディスクリプタテーブル）を設定
+      → プロテクトモード（32bit）に切り替え
+      → さらにロングモード（64bit）に切り替え（x86-64の場合）
+      → ページングを有効化（恒等マップ: 仮想=物理で初期化）
+      → C言語のカーネル本体 start_kernel() を呼び出す
+
+【1-2. A20ラインの有効化】
+
+  IBM PC互換機では、1MBを超えるアドレスへのアクセスに A20 アドレスライン
+  （21ビット目のアドレスビット）を有効にする必要がある。
+
+  方法（複数あり。確実なのは複数試す）:
+    a) BIOS INT 0x15, AX=0x2401 で要求
+    b) キーボードコントローラ経由でポート 0x64/0x60 に書き込む
+    c) Fast A20: ポート 0x92 の bit1 をセット
+
+  確認方法:
+    アドレス 0x100000 と 0x000000 に異なる値を書き込み、読み返して一致しないことを確認
+
+【1-3. GDTの設定（プロテクトモード移行前）】
+
+  GDT（グローバルディスクリプタテーブル）はセグメントを定義する構造体の配列。
+  各エントリ（ディスクリプタ）は8バイト。
+
+  最低限必要なエントリ:
+    エントリ0: ヌルディスクリプタ（必須。8バイトすべて0）
+    エントリ1: コードセグメント（base=0, limit=4GB, type=コード, DPL=0）
+    エントリ2: データセグメント（base=0, limit=4GB, type=データ, DPL=0）
+
+  コードで表現すると（C構造体）:
+    struct gdt_entry {
+        uint16_t limit_low;    // limit[15:0]
+        uint16_t base_low;     // base[15:0]
+        uint8_t  base_mid;     // base[23:16]
+        uint8_t  access;       // アクセス権フラグ
+        uint8_t  granularity;  // limit[19:16] + フラグ
+        uint8_t  base_high;    // base[31:24]
+    } __attribute__((packed));
+
+  access フィールドの構成（8bit）:
+    bit7: 存在ビット（Present）= 1
+    bit6-5: DPL（特権レベル）= 0（カーネル）or 3（ユーザー）
+    bit4: ディスクリプタタイプ = 1（コード/データ）
+    bit3-0: タイプフラグ（コードなら0b1010、データなら0b0010 等）
+
+  LGDT命令でGDTRレジスタに設定する:
+    struct gdt_ptr {
+        uint16_t limit;   // テーブルサイズ-1
+        uint64_t base;    // テーブルのアドレス
+    } __attribute__((packed));
+    asm volatile("lgdt %0" : : "m"(gdt_ptr));
+
+【1-4. ロングモード（64bit）への移行手順】
+
+  [1] PAE（物理アドレス拡張）を有効化
+      CR4 レジスタの bit5（PAE）をセット
+
+  [2] 初期ページテーブルを構築
+      PML4 → PDPT → PD → PT の4段階構造
+      最低限: 先頭4MB程度を恒等マップ（仮想=物理）
+
+  [3] CR3 に PML4テーブルの物理アドレスをセット
+
+  [4] EFER MSR（アドレス: 0xC0000080）の LME bit（bit8）をセット
+      asm("wrmsr" で書き込む)
+
+  [5] CR0 の PG bit（bit31）と PE bit（bit0）をセット
+      → これでロングモード有効化。次の命令からは64bitコード
+
+  [6] 64bit用の CS セグメントにファージャンプ
+      asm("ljmp $0x08, $long_mode_start")
+
+【1-5. start_kernel() でやること（C言語側の初期化）】
+
+  start_kernel() は以下を順に呼ぶのが典型:
+
+    1. setup_arch()         // アーキテクチャ固有初期化（CPUの確認等）
+    2. mm_init()            // メモリ管理サブシステム初期化
+    3. sched_init()         // スケジューラ初期化
+    4. init_IRQ()           // 割り込みコントローラ初期化（PIC/APIC）
+    5. time_init()          // タイマー初期化（PIT/HPET/TSC）
+    6. vfs_init()           // 仮想ファイルシステム初期化
+    7. rest_init()          // init プロセス（PID=1）を作成してスケジューラを走らせる
+
+================================================================================
+第2章  メモリ管理
+================================================================================
+
+【2-1. 物理メモリの把握】
+
+  ブートローダから渡されるメモリマップ（e820 マップ等）を解析する。
+  各エントリ:
+    struct e820_entry {
+        uint64_t addr;   // 開始物理アドレス
+        uint64_t size;   // バイト数
+        uint32_t type;   // 1=利用可能, 2=予約済み, 3=ACPI, ...
+    };
+
+  BIOSのINT 0x15, AX=0xE820 で取得（16bitコードで取得してから引き渡す）
+  UEFI の場合は GetMemoryMap() で取得
+
+  メモリマップを元に:
+    - 利用可能領域を「フリーフレームリスト」または「ビットマップ」で管理する
+
+【2-2. 物理ページフレームアロケータ（PMA）】
+
+  物理メモリを固定サイズ（通常4096バイト = 4KB）のページフレームに分割して管理する。
+
+  === バディアロケータ（buddy allocator） ===
+
+  バディアロケータは Linux カーネルが採用する方式。
+  2^0, 2^1, ..., 2^MAX_ORDER の各サイズのフリーリストを持つ。
+
+  データ構造:
+    struct free_area {
+        struct list_head free_list;   // 空きブロックのリスト
+        unsigned long    nr_free;     // 空きブロック数
+    };
+    free_area[MAX_ORDER];  // MAX_ORDER = 11 (最大 2^10=1024 ページ)
+
+  アロケート（2^n ページ要求時）:
+    [1] free_area[n] にブロックがあれば取り出して返す
+    [2] なければ free_area[n+1] からブロックを取り出し、2分割
+        片方を free_area[n] に戻し、もう片方を返す
+    [3] n+1 もなければ n+2 へ再帰的に昇る
+
+  解放（アドレス A、オーダー n のブロックを返却）:
+    [1] バディアドレスを計算: buddy = A XOR (1 << (n + PAGE_SHIFT))
+    [2] バディが free_area[n] にあれば、2つをマージして free_area[n+1] に昇格
+    [3] MAX_ORDER まで繰り返す
+
+  ページフレーム番号（PFN）とアドレスの変換:
+    PFN = 物理アドレス >> PAGE_SHIFT  （PAGE_SHIFT = 12 for 4KB pages）
+    物理アドレス = PFN << PAGE_SHIFT
+
+【2-3. スラブアロケータ（kmalloc / kfree 用）】
+
+  ページより小さいオブジェクト（構造体等）の効率的な割り当てに使う。
+  同じサイズのオブジェクトを「スラブ」という塊で管理し、フラグメンテーションを減らす。
+
+  基本的なスラブの構造:
+    1ページ（または複数ページ）を1スラブとする
+    スラブの先頭にメタデータ（空きオブジェクトのリンクリスト）を置く
+    各オブジェクトは次の空きオブジェクトへのポインタを持つ（解放済み時）
+
+  キャッシュ（kmem_cache）:
+    struct kmem_cache {
+        size_t obj_size;           // オブジェクトサイズ
+        struct list_head slabs_full;    // 空きなし
+        struct list_head slabs_partial; // 一部空き
+        struct list_head slabs_empty;   // 全部空き
+        // ...
+    };
+
+  kmalloc() の動作:
+    [1] サイズを最も近い2の累乗に切り上げ（8, 16, 32, 64, ... 4096バイト等）
+    [2] 対応する kmem_cache を選択
+    [3] slabs_partial から空きオブジェクトを取り出す
+    [4] なければ slabs_empty から新しいスラブを取る
+    [5] それもなければ PMA から新規ページを確保してスラブを作る
+
+  kfree() の動作:
+    [1] アドレスからスラブのメタデータを特定（アドレスをページサイズでアラインしてページ構造体を得る）
+    [2] フリーリストにつなぎ直す
+    [3] スラブが全部空になったら slabs_empty に移す（一定時間後にPMAへ返却）
+
+【2-4. 仮想メモリ（ページング）】
+
+  x86-64の4段ページテーブル構造:
+    CR3 → PML4テーブル（512エントリ）
+             ↓（インデックスはVA[47:39]）
+           PDPTテーブル（512エントリ）
+             ↓（インデックスはVA[38:30]）
+           PDテーブル（512エントリ）
+             ↓（インデックスはVA[29:21]）
+           PTテーブル（512エントリ）
+             ↓（インデックスはVA[20:12]）
+           物理ページフレーム
+             + ページ内オフセット（VA[11:0]）
+
+  各ページテーブルエントリ（PTE）は64bit:
+    bit0:  P（Present）= 1 で有効
+    bit1:  R/W（Read/Write）= 1 で書き込み可
+    bit2:  U/S（User/Supervisor）= 1 でユーザー空間からアクセス可
+    bit3:  PWT（Page Write Through）
+    bit4:  PCD（Page Cache Disable）
+    bit5:  A（Accessed）= CPU がアクセスしたとき自動でセット
+    bit6:  D（Dirty）= 書き込みがあったとき自動でセット（PTのみ）
+    bit63: NX（No Execute）= 1 で実行禁止
+    bit51:12: 物理フレームアドレス（上位ビット）
+
+  カーネルアドレス空間とユーザーアドレス空間:
+    x86-64では仮想アドレスは48bit有効（正規アドレス）
+    0x0000_0000_0000_0000 〜 0x0000_7FFF_FFFF_FFFF → ユーザー空間（128TB）
+    0xFFFF_8000_0000_0000 〜 0xFFFF_FFFF_FFFF_FFFF → カーネル空間（128TB）
+
+  プロセスごとに独立したPML4テーブルを持つ
+  カーネル空間はすべてのプロセスで同じマッピング（共有）
+
+【2-5. 仮想メモリエリア（VMA）とプロセスアドレス空間】
+
+  プロセスの仮想アドレス空間は「VMA（Virtual Memory Area）」という区間に分割される。
+
+  struct vm_area_struct {
+      unsigned long vm_start;     // 区間の開始仮想アドレス
+      unsigned long vm_end;       // 区間の終了仮想アドレス
+      unsigned long vm_flags;     // VM_READ, VM_WRITE, VM_EXEC 等
+      struct file  *vm_file;      // マップされているファイル（なければNULL）
+      unsigned long vm_pgoff;     // ファイル内オフセット（ページ単位）
+      struct vm_operations_struct *vm_ops;  // fault handler 等
+  };
+
+  プロセス（mm_struct）は VMA を赤黒木（rbtree）で管理する（高速な区間検索のため）
+
+  mmap() システムコールの動作:
+    [1] 要求されたサイズと属性で新しい VMA を作成
+    [2] 既存の VMA と連続・同属性なら結合
+    [3] ページテーブルにはまだマッピングしない（遅延マッピング）
+
+【2-6. ページフォルト処理（デマンドページング）】
+
+  ページフォルトは CPU が例外 #PF（割り込みベクタ14番）を発生させることで通知される。
+  CR2 レジスタにフォルトしたアドレスが入っている。
+
+  page_fault ハンドラの動作:
+    [1] CR2 からフォルトアドレス取得
+    [2] エラーコード確認（存在しない/保護違反、読み書き、ユーザー/カーネル）
+    [3] そのアドレスに対応する VMA を mm_struct から検索
+    [4] VMA が見つからない → Segmentation Fault（SIGSEGVを送る）
+    [5] VMA が見つかった → handle_mm_fault() でページを確保
+
+  handle_mm_fault() の動作:
+    a) ページテーブルを辿り、対応するPTEを確認
+    b) PTEが未マップ（Pビット=0）の場合:
+       - ファイルマップなら vm_ops->fault() を呼んでページキャッシュから持ってくる
+       - 匿名マップなら新しい物理ページをゼロクリアして割り当てる
+       - PTEを書き込んで TLB フラッシュ
+    c) COW（Copy-on-Write）の場合:
+       - 書き込みフォルトで、PTEが読み取り専用でVMAがVW_WRITEなら
+       - 元ページをコピーして新しい書き込み可能ページをPTEにセット
+
+【2-7. Copy-on-Write（COW）の仕組み】
+
+  fork() 時にページテーブルをコピーするが、物理ページは共有する。
+  共有ページのPTEをすべて「読み取り専用」にマーク。
+  どちらかのプロセスが書き込もうとすると保護違反のページフォルト発生。
+  → ページをコピーして自分専用のページを作り、PTEを書き込み可能にする。
+
+  ページの参照カウント（page->_refcount）で管理:
+    fork後は2（親・子が共有）
+    COW発生時はコピーして片方のカウントを1に減らす
+    カウントが0になったらPMAへ返却
+
+【2-8. スワップ（ページアウト）】
+
+  物理メモリが枯渇しそうになるとスワップデーモン（kswapd）が起動。
+
+  動作:
+    [1] アクセス頻度の低いページ（A/Dビットで判断）を候補に選ぶ
+    [2] ダーティ（Dirty）なページはスワップデバイスに書き出す
+    [3] クリーンなページは単純に解放（ファイルページは再読み込み可能なので）
+    [4] PTEを無効化しスワップエントリ（swap_type | swap_offset）を記録
+    [5] 後でアクセスされたらページフォルト → スワップから読み戻す
+
+================================================================================
+第3章  プロセス管理
+================================================================================
+
+【3-1. プロセスディスクリプタ（task_struct）】
+
+  カーネルはプロセスを「task_struct」という巨大な構造体で管理する。
+
+  重要なフィールド（抜粋）:
+    struct task_struct {
+        volatile long state;     // TASK_RUNNING, TASK_INTERRUPTIBLE, 等
+        pid_t pid;               // プロセスID
+        pid_t tgid;              // スレッドグループID（マルチスレッド時）
+        struct task_struct *parent;      // 親プロセス
+        struct list_head children;       // 子プロセスのリスト
+        struct list_head sibling;        // 同じ親の兄弟プロセス
+        struct mm_struct *mm;            // アドレス空間（NULLならカーネルスレッド）
+        struct mm_struct *active_mm;     // 現在使用中のmm
+        struct files_struct *files;      // オープンファイルディスクリプタテーブル
+        struct fs_struct    *fs;         // ルート・カレントディレクトリ
+        struct signal_struct *signal;    // シグナル処理情報
+        struct sighand_struct *sighand;  // シグナルハンドラテーブル
+        sigset_t blocked;                // ブロックされているシグナルマスク
+        sigset_t pending;                // 保留シグナル
+        unsigned long flags;             // PF_EXITING 等のフラグ
+        struct sched_entity se;          // スケジューラ用エンティティ
+        // ... 他多数
+    };
+
+  プロセスの状態遷移:
+    TASK_RUNNING      → CPUで実行中、またはランキューで実行待ち
+    TASK_INTERRUPTIBLE  → イベント待ちスリープ（シグナルで起こせる）
+    TASK_UNINTERRUPTIBLE→ イベント待ちスリープ（シグナルで起こせない、I/O待ち等）
+    TASK_STOPPED      → STOPシグナルで停止
+    TASK_ZOMBIE       → 終了済みだが親がwait()していない（ゾンビ状態）
+    EXIT_DEAD         → 完全に終了（task_structが解放される直前）
+
+【3-2. fork() の実装】
+
+  fork() は "カーネル内で do_fork() → copy_process() を呼ぶ" という構造。
+
+  copy_process() の動作（順に実行）:
+    [1] dup_task_struct()
+        → 現在の task_struct のコピーを作る
+        → カーネルスタックも新規確保（通常8KB or 16KB）
+        → thread_info 構造体を新スタックの底に置く
+
+    [2] PIDの割り当て
+        → alloc_pid() で一意のPIDを払い出す
+        → PIDはハッシュテーブルで管理（pid → task_struct の検索に使う）
+
+    [3] アドレス空間のコピー（copy_mm）
+        → CLONE_VM フラグなし（通常のfork）: mm_struct を複製
+          - VMA リストをコピー
+          - ページテーブルをコピーして全ページをCOW（読み取り専用）にマーク
+          - 参照カウントを更新
+        → CLONE_VM フラグあり（スレッド）: 同じ mm_struct を共有
+
+    [4] ファイルディスクリプタのコピー（copy_files）
+        → CLONE_FILES なし: files_struct を複製、各ファイルの参照カウントを++
+        → CLONE_FILES あり: 同じ files_struct を共有
+
+    [5] シグナルハンドラのコピー（copy_sighand）
+
+    [6] 子プロセスのレジスタ状態を設定
+        → 親と同じレジスタ内容だが、RAX（fork()の戻り値）= 0 にセット
+        → 親の fork() は子のPIDを返す
+
+    [7] 子をランキューに追加（wake_up_new_task）
+
+  vfork() の違い:
+    CLONE_VFORK フラグを追加
+    → 子が exec() または exit() を呼ぶまで親を TASK_UNINTERRUPTIBLE でスリープ
+    → mm は共有（COWなし）なのでページコピーが起きない。高速だが危険。
+
+【3-3. exec() の実装】
+
+  execve(const char *filename, char *const argv[], char *const envp[])
+
+  do_execve() の動作:
+    [1] ファイルを開き、先頭バイトを読む（マジックナンバーで形式判別）
+        → ELFなら ELF ローダへ
+        → #! スクリプトならシェバン処理（インタプリタを起動）
+
+    [2] ELFローダ（load_elf_binary）の動作:
+        a) ELFヘッダ検証（マジック: 0x7F 'E' 'L' 'F'）
+        b) プログラムヘッダ（PHDRs）を読む
+        c) 各 LOAD セグメントを VMA としてマップ
+           - PT_LOAD, flags=RX → テキストセグメント（コード）
+           - PT_LOAD, flags=RW → データセグメント
+        d) 動的リンカ（/lib/ld-linux.so）がある場合はそれもマップ
+        e) ブレーク（brk）を初期化（ヒープの開始アドレス）
+        f) スタック領域を確保（通常8MB、最大はulimitで制限）
+        g) スタックに argc, argv, envp, 補助ベクタ（auxv）を積む
+
+    [3] 現在のプロセスのアドレス空間を置き換える（exec_mmap）
+        → 旧 mm_struct の全VMAを解放
+        → 新しいマッピングに切り替え
+
+    [4] カーネルスタック上のレジスタを上書き
+        → RIP = ELFの Entry Point（または動的リンカのエントリポイント）
+        → RSP = 新しいスタックトップ
+
+    [5] システムコールから「戻る」と新しいプログラムが実行される
+
+【3-4. プロセスの終了（exit()）】
+
+  sys_exit() の動作:
+    [1] task_struct の state を EXIT_ZOMBIE に変更（まだ消えない）
+    [2] オープンファイルをすべてクローズ（参照カウントを減らす）
+    [3] メモリを解放（mm_put: mm_struct の参照カウントを減らし0になれば解放）
+    [4] 子プロセスがいれば init（PID=1）に養子縁組（reparent_to_init）
+    [5] 親プロセスに SIGCHLD を送る
+    [6] 親が wait() で待っていれば起こす
+
+  wait() の動作（親側）:
+    [1] TASK_ZOMBIE の子を探す
+    [2] あれば: 終了コードを取り出す、task_struct を解放（release_task）
+    [3] なければ: TASK_INTERRUPTIBLE でスリープ → SIGCHLD で起こされる
+
+================================================================================
+第4章  スケジューラ
+================================================================================
+
+【4-1. スケジューラの役割】
+
+  複数のプロセスが「同時に」動いているように見せる仕組み。
+  実際はCPU時間を細かく分けて各プロセスに割り当てる（タイムスライス）。
+  いつ誰に切り替えるかを決めるのがスケジューリングアルゴリズム。
+
+【4-2. CFS（Completely Fair Scheduler）の概念】
+
+  Linux 2.6.23以降の主要スケジューリングアルゴリズム。
+
+  コアアイデア:
+    「すべてのプロセスが等しいCPU時間を受け取る理想的なプロセッサ」をシミュレート。
+    実際には各プロセスが実行されるたびに「仮想時間（vruntime）」を進める。
+    常に vruntime が最も小さい（最も損をしている）プロセスを次に実行する。
+
+  vruntime の計算:
+    delta_exec = 実際に実行した時間（ナノ秒）
+    weight = nice値から決まる重み（nice 0 = 1024, nice 1 = 820, ...）
+    delta_vruntime = delta_exec * NICE_0_WEIGHT / weight
+    → 重みが大きい（nice値が小さい＝高優先度）ほど vruntime の増分が小さい
+    → vruntime が小さいままになるので次回選ばれやすい
+
+  データ構造:
+    ランキューごとに「赤黒木（rb-tree）」を持つ
+    vruntimeでソートされた木構造
+    最左ノード（vruntime最小）が次の実行候補（O(1)でアクセス可）
+
+【4-3. ランキューの構造】
+
+  CPUごとに1つのランキュー（rq）を持つ（SMP対応）:
+    struct rq {
+        unsigned int nr_running;     // 実行可能プロセス数
+        struct cfs_rq cfs;           // CFSのランキュー
+        struct rt_rq  rt;            // リアルタイムランキュー
+        struct task_struct *curr;    // 現在実行中のタスク
+        struct task_struct *idle;    // アイドルタスク
+        u64 clock;                   // ランキューのクロック（ナノ秒）
+        // ...
+    };
+
+  スケジューリングクラスの優先順位:
+    RT（リアルタイム）クラス > CFS クラス > Idle クラス
+    RTタスクがある限りCFSタスクは実行されない
+
+【4-4. コンテキストスイッチの実装】
+
+  schedule() → context_switch(rq, prev, next) の流れ:
+
+  [1] switch_mm(prev->mm, next->mm, next)
+      → CR3 に next->mm の PML4 アドレスをロード
+      → TLB を無効化（ただし ASID/PCIDが使える場合は不要）
+
+  [2] switch_to(prev, next, prev)
+      → 汎用レジスタを保存（スタックに push）
+      → prev の RSP を prev->thread.sp に保存
+      → RSP に next->thread.sp をロード
+      → TSS（Task State Segment）の RSP0 を next のカーネルスタックに更新
+         ※ RSP0: ユーザー→カーネル遷移時に使うカーネルスタックポインタ
+      → next の RSP からレジスタを復元（pop）
+      → RET 命令で next のコードに飛ぶ
+         （next のスタックにはリターンアドレスが積まれている）
+
+  アセンブリレベルのイメージ（x86-64）:
+    ; --- prev を保存 ---
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [prev + THREAD_SP], rsp
+
+    ; --- next に切り替え ---
+    mov rsp, [next + THREAD_SP]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret   ; → next の実行コンテキストに戻る
+
+【4-5. タイマー割り込みとプリエンプション】
+
+  タイマー割り込み（HZ = 100〜1000回/秒）のたびに:
+    [1] rq->clock を更新
+    [2] 現在タスクの se.sum_exec_runtime を更新
+    [3] scheduler_tick() を呼ぶ
+    [4] CFSは vruntime を更新し、最左ノードより大きすぎたら need_resched フラグをセット
+
+  need_resched フラグが立ったら:
+    → 割り込みからカーネルに戻る際に schedule() を呼ぶ（プリエンプション）
+
+  カーネルプリエンプション:
+    2.6以降のLinuxはカーネル内でも安全な場所（preempt_count == 0）でプリエンプション可能
+    スピンロック取得中は preempt_count++ でプリエンプション禁止
+
+【4-6. SMP（マルチコア）対応：ロードバランシング】
+
+  ロードバランサは定期的（またはコアがアイドルになったとき）に実行:
+    [1] 各CPUのランキューの負荷（ランニングタスク数 × 重み）を計算
+    [2] 最も忙しいCPUから最も暇なCPUへタスクを移動（migrate）
+    [3] タスクのマイグレーション: prev CPU のランキューから外し、next CPU に追加
+
+  キャッシュ親和性（cache affinity）考慮:
+    直前にそのCPUで動いていたタスクは同じCPUに残した方がキャッシュヒット率が高い
+    →負荷差が一定以上にならないとマイグレーションしない
+
+================================================================================
+第5章  システムコール機構
+================================================================================
+
+【5-1. システムコールとは】
+
+  ユーザー空間（リング3）からカーネル（リング0）のサービスを呼ぶ仕組み。
+  直接関数呼び出しではなく、CPUの特権遷移命令を使う。
+
+  x86-64 では SYSCALL 命令を使う（32bit時代は INT 0x80）:
+    SYSCALL: ユーザー→カーネルへの高速遷移
+    SYSRET:  カーネル→ユーザーへの高速帰還
+
+【5-2. SYSCALL命令の動作】
+
+  SYSCALL実行時にCPUが自動でやること:
+    [1] RCX ← RIP（次の命令アドレスを保存）
+    [2] R11 ← RFLAGS（フラグを保存）
+    [3] RIP ← IA32_LSTAR MSR（カーネルのエントリポイントアドレス）
+    [4] CS  ← GDTのカーネルコードセグメント
+    [5] SS  ← GDTのカーネルデータセグメント
+    [6] RFLAGS のIFビット（割り込み許可）をクリア（オプション）
+
+  IA32_LSTAR MSR の設定（起動時）:
+    wrmsr(IA32_LSTAR, (uint64_t)syscall_entry_point);
+
+  System V AMD64 ABI でのシステムコール規約:
+    RAX = システムコール番号
+    RDI = 第1引数
+    RSI = 第2引数
+    RDX = 第3引数
+    R10 = 第4引数（R10を使う! RCXはSYSCALLが書き換えるため）
+    R8  = 第5引数
+    R9  = 第6引数
+    戻り値 = RAX（負の値はエラー、errno は -RAX に変換）
+
+【5-3. システムコールエントリポイントのアセンブリ】
+
+  syscall_entry:
+    ; スタックをユーザーから切り替え（RSP は TSS.RSP0 に）
+    swapgs          ; GS ベースとKernel GS ベースを交換
+                    ; （per-CPU 変数へのアクセスに使う）
+
+    ; カーネルスタックポインタを取得（per-CPU 変数から）
+    mov rsp, gs:[cpu_tss + TSS_sp2]
+
+    ; レジスタを保存（pt_regs 構造体に）
+    push ss
+    push [user_rsp from gs]
+    push r11        ; ユーザーRFLAGS
+    push cs         ; ユーザーCS
+    push rcx        ; ユーザーRIP（リターンアドレス）
+    push rax        ; syscall番号
+    push rdi, rsi, rdx, r10, r8, r9 等
+
+    ; C関数を呼ぶ
+    call do_syscall_64
+
+    ; 返り値を RAX に乗せてユーザー空間に戻る
+    ; レジスタを復元して SYSRET
+
+  do_syscall_64() の実装（C言語）:
+    void do_syscall_64(struct pt_regs *regs) {
+        unsigned long nr = regs->orig_ax;
+        if (nr < NR_syscalls) {
+            regs->ax = syscall_table[nr](
+                regs->di, regs->si, regs->dx,
+                regs->r10, regs->r8, regs->r9);
+        } else {
+            regs->ax = -ENOSYS;
+        }
+    }
+
+【5-4. システムコールテーブル】
+
+  syscall_table はただの関数ポインタ配列:
+    typedef long (*sys_call_ptr_t)(unsigned long, unsigned long, ...);
+    sys_call_ptr_t syscall_table[NR_syscalls] = {
+        [0]  = sys_read,
+        [1]  = sys_write,
+        [2]  = sys_open,
+        [3]  = sys_close,
+        [4]  = sys_stat,
+        [9]  = sys_mmap,
+        [12] = sys_brk,
+        [17] = sys_pread64,
+        [39] = sys_getpid,
+        [57] = sys_fork,
+        [59] = sys_execve,
+        [60] = sys_exit,
+        [61] = sys_wait4,
+        // ... (Linux は400種類以上)
+    };
+
+【5-5. 代表的なシステムコールの実装概要】
+
+  sys_read(int fd, void __user *buf, size_t count):
+    [1] fd を files_struct から file* に変換（fcheck）
+    [2] file->f_op->read(file, buf, count, &file->f_pos) を呼ぶ
+    [3] buf はユーザー空間ポインタなので copy_to_user() で安全にコピー
+
+  sys_write(int fd, const void __user *buf, size_t count):
+    [1] fd → file*
+    [2] copy_from_user() でカーネルバッファにコピー
+    [3] file->f_op->write() を呼ぶ
+
+  sys_open(const char __user *filename, int flags, umode_t mode):
+    [1] ユーザー空間からファイルパスを取得（getname）
+    [2] VFSを使ってパスをたどりiノードを見つける（do_filp_open）
+    [3] ファイルオブジェクト（struct file）を作成
+    [4] files_struct にファイルオブジェクトをセットしてfdを返す
+
+  sys_mmap(addr, length, prot, flags, fd, offset):
+    [1] 引数を検証（アラインメント、サイズ制限等）
+    [2] do_mmap_pgoff() を呼ぶ
+    [3] 仮想アドレスを選択（addr=0なら空き領域を自動選択）
+    [4] VMA を作成して mm_struct に追加
+    [5] 実際のページマッピングは遅延（ページフォルト時に行う）
+
+================================================================================
+第6章  割り込み・例外処理
+================================================================================
+
+【6-1. 割り込みと例外の違い】
+
+  例外（Exception）:
+    → CPU 自身が命令実行中に発生
+    → ゼロ除算、無効命令、ページフォルト、システムコール（INT命令経由）等
+    → 同期的（命令に対応して発生）
+
+  割り込み（Interrupt）:
+    → 外部デバイスや他CPU（IPIとして）から発生
+    → タイマー割り込み、キーボード、ネットワークパケット受信等
+    → 非同期的（いつでも発生しうる）
+
+【6-2. IDT（割り込みディスクリプタテーブル）】
+
+  IDT は 256 エントリのテーブル（ベクタ番号 0〜255）。
+  IDTR レジスタ（LIDT命令でロード）がベースアドレスとサイズを保持。
+
+  各エントリ（ゲートディスクリプタ）は 16バイト:
+    struct idt_entry {
+        uint16_t offset_low;    // ハンドラアドレスの下位16bit
+        uint16_t selector;      // コードセグメントセレクタ
+        uint8_t  ist;           // IST（割り込みスタックテーブル）インデックス
+        uint8_t  type_attr;     // タイプ・DPL・Pビット
+        uint16_t offset_mid;    // ハンドラアドレスの中位16bit
+        uint32_t offset_high;   // ハンドラアドレスの上位32bit
+        uint32_t reserved;      // 0
+    } __attribute__((packed));
+
+  type_attr の内訳:
+    bit7:   P（Present）= 1
+    bit6-5: DPL（0=カーネルのみ呼べる、3=ユーザーから INT n で呼べる）
+    bit4:   0（ゲートの場合）
+    bit3-0: 0b1110 = 64bit割り込みゲート（IFビット自動クリア）
+             0b1111 = 64bit トラップゲート（IFビットそのまま）
+
+  よく使う割り込みベクタ番号:
+    0:  #DE ゼロ除算
+    1:  #DB デバッグ
+    2:  NMI（ノンマスカブル割り込み）
+    3:  #BP ブレークポイント（INT3）
+    4:  #OF オーバーフロー
+    6:  #UD 無効オペコード
+    8:  #DF ダブルフォルト
+    13: #GP 一般保護違反
+    14: #PF ページフォルト（CR2にフォルトアドレス）
+    32-255: 外部デバイス割り込み（ベクタはPIC/APICで設定）
+
+【6-3. 割り込み発生時のCPU動作】
+
+  割り込み/例外が発生すると CPUは自動で:
+    [1] 現在の SS と RSP をスタックに積む（ユーザー→カーネル遷移時のみ）
+    [2] RFLAGS を積む
+    [3] CS と RIP を積む
+    [4] エラーコードを積む（#PF, #GP 等一部の例外のみ）
+    [5] IDT[ベクタ番号] からハンドラアドレスと CS を読む
+    [6] CS:RIP をハンドラに変更してジャンプ
+
+  ハンドラの責務:
+    [1] 残りのレジスタを保存（汎用レジスタ等）→ pt_regs 構造体
+    [2] C 言語のハンドラ関数を呼ぶ
+    [3] レジスタを復元
+    [4] IRET 命令（割り込みからの帰還）
+        → CS, RIP, RFLAGS を復元
+        → ユーザー空間なら SS, RSP も復元
+
+【6-4. PIC と APIC の設定】
+
+  レガシー PIC（8259A）:
+    2枚のPIC（マスタ+スレーブ）でIRQ 0〜15 を管理
+    マスタPIC: ポート 0x20（コマンド）, 0x21（データ）
+    スレーブPIC: ポート 0xA0（コマンド）, 0xA1（データ）
+    初期化（ICWシーケンス）後、IRQをベクタ番号32〜47にマップ
+    使用後は EOI（End of Interrupt）コマンドを送る（0x20に0x20を書く）
+
+  APIC（Advanced PIC）:
+    モダンなシステムはLocal APIC（各CPU）+ I/O APIC を使う
+    Local APICはメモリマップドI/O（アドレス 0xFEE00000 等）
+    I/O APICはIRQをLocal APICのベクタにルーティング
+    SMP（マルチコア）に対応、IPI（プロセッサ間割り込み）も使える
+
+  タイマー割り込みの設定（PIT: プログラマブルインターバルタイマー）:
+    PIT ポート: 0x40（CH0 カウンタ）, 0x43（コントロール）
+    クロック周波数 1193182 Hz を HZ（例:1000）で割った値をロード
+    → 1ms ごとに IRQ0 が発生
+
+【6-5. 割り込みハンドラの実装パターン】
+
+  割り込みハンドラは2段構成が一般的（デバイスドライバで多用）:
+
+  上半分（top half / hard IRQ ハンドラ）:
+    → 割り込みコンテキストで実行（プロセスコンテキストではない）
+    → 最小限の処理のみ（データを受け取る、フラグをセットする）
+    → スリープしてはいけない
+    → 可能な限り短く終わらせる
+
+  下半分（bottom half）:
+    → 後で遅延実行（割り込みが戻ってから）
+    → softirq, tasklet, work queue のいずれかを使う
+
+  softirq:
+    → 静的に定義された32個のソフト割り込み
+    → TIMER_SOFTIRQ, NET_RX_SOFTIRQ, NET_TX_SOFTIRQ 等
+    → do_softirq() で処理（割り込みハンドラ終了後、スケジューラ前等）
+
+  tasklet:
+    → softirq の上に構築された動的な遅延実行機構
+    → 同一taskletは同時に1CPUでのみ実行される保証あり
+
+  work queue:
+    → カーネルスレッドで実行されるため、スリープできる
+    → kworker スレッドが処理する
+
+================================================================================
+第7章  仮想ファイルシステム（VFS）
+================================================================================
+
+【7-1. VFS の役割】
+
+  VFS（Virtual File System Switch）は、異なる実ファイルシステム
+  （ext4, FAT, NFS, proc, sysfs 等）を同一のインターフェースで扱うための抽象層。
+  ユーザーは同じ open/read/write/close を使ってどのFSにもアクセスできる。
+
+【7-2. VFS の主要データ構造】
+
+  struct super_block（スーパーブロック）:
+    → ファイルシステムのメタデータ（型、サイズ、ルートiノード等）
+    → マウント時に作成、アンマウント時に破棄
+    struct super_block {
+        struct file_system_type *s_type;
+        struct super_operations *s_op;
+        struct inode *s_root;      // ルートディレクトリのiノード
+        unsigned long s_blocksize; // ブロックサイズ
+        // ...
+    };
+
+  struct inode（アイノード）:
+    → ファイル/ディレクトリのメタデータ（サイズ、パーミッション、所有者等）
+    → ファイルの「実体」を表す。ファイル名は持たない
+    struct inode {
+        unsigned long   i_ino;       // iノード番号
+        umode_t         i_mode;      // ファイル種別+パーミッション
+        uid_t           i_uid;
+        gid_t           i_gid;
+        loff_t          i_size;      // ファイルサイズ
+        struct timespec i_atime;     // アクセス時刻
+        struct timespec i_mtime;     // 変更時刻
+        struct timespec i_ctime;     // メタデータ変更時刻
+        unsigned long   i_nlink;     // ハードリンク数
+        struct super_block *i_sb;
+        struct inode_operations *i_op;
+        struct address_space *i_mapping; // ページキャッシュへの参照
+    };
+
+  struct dentry（ディレクトリエントリ）:
+    → ファイル名とiノードの対応（パスをキャッシュする）
+    → dエントリキャッシュ（dcache）でパス解決を高速化
+    struct dentry {
+        struct inode        *d_inode;   // 対応するiノード（NULL = 負キャッシュ）
+        struct dentry       *d_parent;  // 親ディレクトリ
+        struct qstr          d_name;    // ファイル名
+        struct super_block  *d_sb;
+        struct dentry_operations *d_op;
+        struct list_head     d_child;   // 同じ親の他エントリ
+        struct list_head     d_subdirs; // 子ディレクトリエントリ
+    };
+
+  struct file（オープンファイル）:
+    → プロセスがopenしたファイルを表す
+    → 複数プロセスが同じiノードを指す複数のfileオブジェクトを持てる
+    struct file {
+        struct dentry       *f_dentry;   // dentryへのポインタ
+        struct file_operations *f_op;   // read, write, ioctl 等
+        loff_t               f_pos;     // ファイルオフセット（シークポインタ）
+        unsigned int         f_flags;   // O_RDONLY, O_WRONLY, O_RDWR 等
+        // ...
+    };
+
+【7-3. パス解決（namei）の実装】
+
+  "/usr/bin/ls" を開く場合のパス解決:
+    [1] "/" からスタート → ルートdentry（VFS名前空間のルート）
+    [2] "usr" を検索:
+        dentry の d_subdirs を探す（dcache ヒット）
+        → なければ i_op->lookup(inode, "usr") を呼んでディスクから読む
+    [3] "bin" を検索（同様）
+    [4] "ls" を検索 → 最終的なdentry と inode が得られる
+    [5] file オブジェクトを作成して返す
+
+  シンボリックリンクの処理:
+    dentry に対応する inode が S_ISLNK の場合:
+    → i_op->readlink() でリンク先パスを取得
+    → そのパスで再度 namei からやり直し（最大 MAXSYMLINKS = 40 回）
+
+【7-4. ファイルシステムの登録とマウント】
+
+  ファイルシステムの登録:
+    struct file_system_type {
+        const char *name;                  // "ext4", "tmpfs" 等
+        int fs_flags;
+        struct dentry *(*mount)(struct file_system_type *, int, 
+                                const char *, void *);
+        void (*kill_sb)(struct super_block *);
+    };
+    register_filesystem(&ext4_fs_type);
+
+  マウント処理（sys_mount）:
+    [1] 対象デバイス（ブロックデバイス）を開く
+    [2] file_system_type の mount() を呼んでスーパーブロックを作成
+        → ext4_mount() ならディスクからスーパーブロックを読み込む
+    [3] マウントポイントのdentryに新FSのルートdentryを「被せる」
+        → vfsmount 構造体でマウントポイントとルートの対応を管理
+
+【7-5. inode operations と file operations】
+
+  inode_operations（ファイルシステムが実装するメタデータ操作）:
+    .lookup   : ディレクトリ内の名前を検索してdentryを返す
+    .create   : 新しいファイルを作成
+    .link     : ハードリンクを作成
+    .unlink   : ファイルを削除
+    .symlink  : シンボリックリンクを作成
+    .mkdir    : ディレクトリを作成
+    .rmdir    : ディレクトリを削除
+    .rename   : ファイルを移動/リネーム
+    .getattr  : 属性（stat）取得
+    .setattr  : 属性変更（chmod等）
+
+  file_operations（開いたファイルへの操作）:
+    .open    : ファイルを開く際の初期化
+    .release : ファイルを閉じる際のクリーンアップ
+    .read    : データを読む
+    .write   : データを書く
+    .llseek  : ファイルオフセットを移動
+    .mmap    : ファイルをメモリにマップ
+    .ioctl   : デバイス固有のコマンド
+    .poll    : select/poll に対応
+
+【7-6. ext4 の簡易実装イメージ】
+
+  ディスクレイアウト（ブロックグループ構造）:
+    [ブートブロック] [スーパーブロック] [グループディスクリプタ]
+    [グループ0: iノードビットマップ | ブロックビットマップ | iノードテーブル | データブロック...]
+    [グループ1: ...] [グループ2: ...]
+
+  ext4_read_inode():
+    [1] iノード番号から所属ブロックグループを計算
+        group = (ino - 1) / INODES_PER_GROUP
+    [2] グループディスクリプタからiノードテーブルの開始ブロックを取得
+    [3] iノードテーブル内のオフセットを計算
+        index = (ino - 1) % INODES_PER_GROUP
+    [4] ブロックを読んでiノード構造体（ext4_inode）を取得
+    [5] VFS の inode 構造体にコピー
+
+  ファイルデータの読み込み:
+    ext4 iノードは i_block[15] という配列でブロックを指す:
+      i_block[0..11]: 直接ブロック番号
+      i_block[12]:    1段間接ブロック（ブロック番号のリストを指す）
+      i_block[13]:    2段間接ブロック
+      i_block[14]:    3段間接ブロック
+    （ext4ではextentベースの新方式も使う）
+
+================================================================================
+第8章  デバイスドライバ基盤
+================================================================================
+
+【8-1. デバイスの種類】
+
+  キャラクタデバイス（char device）:
+    → バイトストリームとしてアクセス（順次読み書き）
+    → TTY, シリアルポート, /dev/random 等
+
+  ブロックデバイス（block device）:
+    → 固定サイズブロック単位でランダムアクセス可能
+    → HDD, SSD, フロッピー等
+    → ページキャッシュを通じてアクセス
+
+  ネットワークデバイス:
+    → パケット単位の送受信
+    → eth0, lo 等。特殊なファイルではなく、ソケット経由でアクセス
+
+【8-2. デバイス番号（major/minor number）】
+
+  デバイスは major:minor の組で識別される（各12bit または各32bit）:
+    major: ドライバの種類（1=メモリ系, 8=SCSI disk, ...）
+    minor: ドライバ内でのデバイス番号（disk0, disk1, ...）
+
+  /dev/sda は major=8, minor=0 など。
+
+  デバイスの登録:
+    register_chrdev(major, "mydev", &my_fops);  // キャラクタデバイス
+    register_blkdev(major, "myblk");            // ブロックデバイス
+
+【8-3. キャラクタデバイスドライバの実装】
+
+  最小限のキャラクタデバイス:
+    static struct file_operations my_fops = {
+        .owner   = THIS_MODULE,
+        .open    = my_open,
+        .release = my_close,
+        .read    = my_read,
+        .write   = my_write,
+    };
+
+  my_read の実装例（カーネル → ユーザーへのコピー）:
+    ssize_t my_read(struct file *f, char __user *buf, size_t len, loff_t *off) {
+        char kbuf[128] = "Hello from kernel!";
+        size_t n = min(len, sizeof(kbuf));
+        if (copy_to_user(buf, kbuf, n))   // ユーザー空間への安全なコピー
+            return -EFAULT;
+        return n;
+    }
+
+  copy_to_user / copy_from_user の必要性:
+    ユーザー空間のポインタは直接参照できない。理由:
+    → アドレス空間が違う（ページテーブルが違う）
+    → 無効なアドレスを指している可能性がある
+    → ページフォルトが起きても安全に処理する必要がある
+    → copy_to_user は内部でアクセス許可確認とフォルト対応を行う
+
+【8-4. ブロックデバイスドライバとI/Oスケジューラ】
+
+  ブロックデバイスへのアクセスは「バイオ（bio）」という構造体で表現:
+    struct bio {
+        struct block_device *bi_bdev;
+        sector_t             bi_sector;  // 開始セクタ番号
+        unsigned int         bi_size;    // バイト数
+        struct bio_vec      *bi_io_vec;  // バッファのベクタ配列
+        bio_end_io_t        *bi_end_io;  // 完了コールバック
+    };
+
+  I/Oスケジューラ（エレベータアルゴリズム）:
+    ディスクの場合、ヘッドを行ったり来たりさせないよう I/O を並べ替える:
+    → CFQ（Completely Fair Queuing）: プロセスごとに公平にI/Oを割り当て
+    → Deadline: リクエストに期限を設け、飢餓を防ぐ
+    → noop: 順番に処理（SSD では十分）
+
+  DMA（Direct Memory Access）:
+    ディスクからのデータ転送は CPU を介さず DMA コントローラが直接メモリに転送
+    → CPU は転送を指示して他の処理をしていられる
+    → 転送完了時に割り込みで通知
+
+================================================================================
+第9章  プロセス間通信（IPC）
+================================================================================
+
+【9-1. パイプ】
+
+  pipe(int fd[2]) で作成。fd[0] が読み込み端、fd[1] が書き込み端。
+
+  内部実装:
+    パイプはカーネル内の固定サイズ環状バッファ（デフォルト 64KB）
+    struct pipe_inode_info {
+        struct pipe_buffer *bufs;   // ページ単位のリングバッファ
+        unsigned int head;          // 次に書き込む位置
+        unsigned int tail;          // 次に読み込む位置
+        unsigned int max_usage;     // バッファ最大サイズ
+        wait_queue_head_t rd_wait;  // 読み込み側の待ちキュー
+        wait_queue_head_t wr_wait;  // 書き込み側の待ちキュー
+    };
+
+  write(fd[1], buf, n):
+    [1] バッファに空きがあれば書き込む
+    [2] なければ rd_wait で wait_event_interruptible してスリープ
+    [3] 読み込み側が読んだら wr_wait を wake_up
+
+  read(fd[0], buf, n):
+    [1] バッファにデータがあれば読む
+    [2] なければ読み込み側がスリープ → 書き込みが来たら wake_up
+
+  パイプのゼロコピー最適化（splice/vmsplice）:
+    パイプバッファをページポインタで持つことで、
+    ページをコピーせず別のファイルディスクリプタに「転送」できる
+
+【9-2. 名前付きパイプ（FIFO）】
+
+  mkfifo("/tmp/myfifo", 0666) でファイルシステム上にFIFOを作成。
+  通常のファイルとして open できるが、内部はパイプと同じ機構。
+  ただし、読み書き両端を別プロセスが担える。
+
+【9-3. メッセージキュー（POSIX / System V）】
+
+  POSIX メッセージキュー (mq_open / mq_send / mq_receive):
+    → 型付きメッセージ（優先度付き）を送受信できる
+    → カーネル内にキュー構造体（mqueue_inode）を持つ
+    → 優先度ヒープで格納
+    → /dev/mqueue にマウントされたmqueuefsでアクセス可能
+
+  System V メッセージキュー:
+    msgget(key, flags): キューを作成 or 取得
+    msgsnd(msqid, msg, size, flags): 送信
+    msgrcv(msqid, msg, size, type, flags): 受信（type でメッセージ種別フィルタ可能）
+
+【9-4. 共有メモリ】
+
+  最も高速なIPC。カーネルの仲介なしにプロセス同士がメモリを読み書きできる。
+
+  POSIX 共有メモリ:
+    shm_open("/myshm", O_CREAT|O_RDWR, 0666)
+    ftruncate(fd, size)
+    mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)
+
+  内部実装:
+    tmpfs（メモリ上のファイルシステム）の特殊なファイルを作成
+    複数プロセスが同じファイルを MAP_SHARED でmmap
+    → 同じ物理ページが各プロセスの仮想アドレス空間にマップされる
+    → 書き込みは即座にもう一方から見える（TLBの即時反映は不要）
+
+  同期の必要性:
+    共有メモリ自体には同期がない。セマフォやミューテックスと組み合わせる。
+
+【9-5. セマフォ（POSIX）】
+
+  sem_open / sem_init でセマフォを作成。
+
+  sem_wait(sem):        // P操作（デクリメント。0なら待つ）
+    atomic_dec(sem);
+    if (sem < 0) { 
+        list_add(current, &sem->waiters);
+        schedule();   // スリープ
+    }
+
+  sem_post(sem):        // V操作（インクリメント。待ちがいれば起こす）
+    atomic_inc(sem);
+    if (!list_empty(&sem->waiters)) {
+        wake_up_process(first_waiter);
+    }
+
+  カーネル内実装はミューテックスとウェイトキューを組み合わせて実装する。
+
+================================================================================
+第10章  シグナル処理
+================================================================================
+
+【10-1. シグナルとは】
+
+  シグナルはプロセスへの非同期通知。UNIX の「ソフトウェア割り込み」。
+  送信側: kill(pid, sig)  / raise(sig) / tkill(tid, sig) 等
+  受信側: 次にカーネルからユーザー空間に戻るとき処理される
+
+  主要なシグナル番号（x86 Linux）:
+    SIGHUP  = 1    ハングアップ（ターミナル切断等）
+    SIGINT  = 2    割り込み（Ctrl+C）
+    SIGQUIT = 3    コアダンプ付き終了（Ctrl+\）
+    SIGKILL = 9    強制終了（捕捉/無視不可）
+    SIGSEGV = 11   セグメンテーション違反
+    SIGPIPE = 13   壊れたパイプへの書き込み
+    SIGALRM = 14   alarm() タイマー
+    SIGTERM = 15   終了要求（捕捉可能）
+    SIGCHLD = 17   子プロセスの状態変化
+    SIGSTOP = 19   一時停止（捕捉/無視不可）
+    SIGCONT = 18   停止中プロセスを再開
+
+【10-2. シグナルの配送メカニズム】
+
+  シグナル送信（send_signal）:
+    [1] ターゲット task_struct を特定
+    [2] SIGKILL/SIGSTOP は特別（常に成功）
+    [3] シグナルをブロックマスク（t->blocked）と照合
+        → ブロック済みなら pending キューに積む（保留）
+        → ブロックされていなければ pending キューに積み、プロセスを起こす
+    [4] task_struct の TIF_SIGPENDING フラグをセット
+
+  シグナル受信（do_signal）:
+    ユーザー空間への帰還直前に呼ばれる（syscall return path, 割り込みreturn path）:
+    [1] TIF_SIGPENDING がセットされているか確認
+    [2] get_signal() でブロックされていない pending シグナルを取り出す
+    [3] SIG_DFL（デフォルト動作）:
+        → SIGTERM/SIGHUP 等: do_exit()
+        → SIGCHLD 等: 無視
+        → SIGSTOP: do_signal_stop()
+        → SIGCORE: コアダンプ後にexit
+    [4] SIG_IGN: 無視して次へ
+    [5] ユーザー定義ハンドラ: setup_rt_frame() でユーザースタックにフレームを積む
+
+【10-3. ユーザー定義シグナルハンドラの呼び出し（setup_rt_frame）】
+
+  目標: ユーザー空間のシグナルハンドラを呼び出し、戻ってきたら元の実行に戻る。
+
+  setup_rt_frame() の動作:
+    [1] 現在のユーザースタックポインタ（RSP）を読む
+    [2] スタックを下方向に伸ばして sigframe を積む:
+        struct rt_sigframe {
+            char *pretcode;          // sigreturn のアドレス（トランポリン）
+            struct ucontext uc;      // ユーザーコンテキスト（レジスタ全部）
+            struct siginfo info;     // シグナル情報
+        };
+    [3] uc.uc_mcontext にシステムコール/割り込み前のレジスタをコピー
+    [4] pt_regs を書き換え:
+        regs->rip = ハンドラ関数のアドレス
+        regs->rsp = sigframe のアドレス
+        regs->rdi = シグナル番号（第1引数）
+    [5] 「ユーザー空間に戻る」とハンドラが実行される
+
+  ハンドラ終了後（sigreturn）:
+    ハンドラは最後に rt_sigreturn() システムコールを呼ぶ（トランポリンコードが行う）:
+    [1] スタックから sigframe を取り出す
+    [2] uc.uc_mcontext のレジスタを pt_regs に復元
+    [3] ユーザー空間に戻ると元の処理から続く
+
+================================================================================
+第11章  ページキャッシュ・バッファキャッシュ
+================================================================================
+
+【11-1. ページキャッシュとは】
+
+  ファイルの内容をメモリにキャッシュする仕組み。
+  同じファイルを繰り返し読むとき、ディスクアクセスをスキップできる。
+
+  struct address_space:
+    → iノードに紐付くページキャッシュ。
+    → ページを radix tree（基数木）または XArray でインデックス（ファイルオフセット/PAGE_SIZE）管理
+    struct address_space {
+        struct inode        *host;        // 所有するiノード
+        struct xarray        i_pages;    // ページのXArray（インデックス=ファイルページ番号）
+        const struct address_space_operations *a_ops;
+        unsigned long        nrpages;
+        // ...
+    };
+
+【11-2. ファイル読み込みの流れ（read システムコール）】
+
+  generic_file_read_iter() の動作:
+    [1] ファイルオフセット（f_pos）からページ番号 index = f_pos >> PAGE_SHIFT
+    [2] find_get_page(mapping, index): キャッシュにページがあるか検索
+    [3] キャッシュヒット: ページからデータを copy_to_user してオフセット更新
+    [4] キャッシュミス:
+        a) page_cache_alloc() で新しいページを確保
+        b) add_to_page_cache_locked() でキャッシュに登録
+        c) a_ops->readpage() でディスクからページを読み込む（I/O）
+        d) wait_on_page_locked() でI/O完了を待つ
+        e) データをユーザーにコピー
+
+【11-3. ファイル書き込みの流れ（write システムコール）】
+
+  generic_file_write_iter() の動作:
+    [1] ページキャッシュに対応ページを確保（読んでくる or 新規作成）
+    [2] copy_from_user() でユーザーデータをページに書き込む
+    [3] mark_page_dirty() でページを「ダーティ」とマーク
+    [4] この時点では **ディスクには書いていない**（ライトバックキャッシュ）
+    [5] 後でカーネルのフラッシャースレッド（bdi-writeback）がダーティページをディスクに書き出す
+
+  writeback のタイミング:
+    → dirty_expire_centisecs（デフォルト30秒）を超えたダーティページ
+    → dirty_background_ratio（デフォルト10%）を超えたとき
+    → fsync()/fdatasync() を明示的に呼んだとき
+    → sync() コマンド実行時
+
+【11-4. ダイレクトI/O（O_DIRECT）】
+
+  O_DIRECT フラグで open したファイルへの read/write は
+  ページキャッシュをバイパスしてディスクに直接I/O。
+  → データベースシステム等、自前キャッシュを持つアプリに使われる
+  → バッファのアライン要件（セクターサイズ境界）がある
+
+================================================================================
+第12章  ネットワークスタック基礎
+================================================================================
+
+【12-1. ソケットとBSD socket API】
+
+  ユーザーはソケットを「ファイルディスクリプタ」として扱う。
+  socket(AF_INET, SOCK_STREAM, 0) → bind → listen → accept → read/write
+
+  カーネル内のソケット表現:
+    struct socket {
+        socket_state     state;     // SS_CONNECTED 等
+        struct proto_ops *ops;      // inet_stream_ops 等（AF/タイプ別操作）
+        struct sock      *sk;       // プロトコル固有のソケット（inet_sock, tcp_sock等）
+    };
+
+    struct sock（プロトコル非依存部）:
+        sk_family, sk_type, sk_protocol
+        sk_rcvbuf, sk_sndbuf   // 受信・送信バッファサイズ
+        sk_receive_queue       // 受信パケットキュー
+        sk_write_queue         // 送信パケットキュー
+        sk_state               // TCP_ESTABLISHED 等のプロトコル状態
+
+【12-2. ネットワークスタックの層構造】
+
+  アプリ: read(fd, buf, n) / write(fd, buf, n)
+          ↕
+  ソケット層: sock_recvmsg() / sock_sendmsg()
+          ↕
+  トランスポート層（TCP/UDP）: tcp_sendmsg() / tcp_rcv()
+          ↕
+  ネットワーク層（IP）: ip_output() / ip_rcv()
+          ↕
+  リンク層（Ethernet）: dev_queue_xmit() / netif_receive_skb()
+          ↕
+  デバイスドライバ（NIC）: ハードウェア
+
+【12-3. sk_buff（ソケットバッファ）】
+
+  ネットワークパケットはカーネル内で sk_buff（skb）という構造体で表現:
+    struct sk_buff {
+        struct sk_buff *next, *prev;  // キューのリンク
+        unsigned char  *head;         // バッファ先頭
+        unsigned char  *data;         // ペイロード開始
+        unsigned char  *tail;         // ペイロード終端
+        unsigned char  *end;          // バッファ終端
+        unsigned int    len;          // ペイロード長
+        unsigned int    data_len;     // フラグメントデータ長
+        __u16           protocol;     // ETH_P_IP 等
+        // ...
+    };
+
+  各層でヘッダを追加/削除する操作:
+    skb_push(skb, len): data を len バイト下げてヘッダ領域を作る（送信側）
+    skb_pull(skb, len): data を len バイト上げてヘッダを剥がす（受信側）
+    → 実際のメモリコピーは発生しない（ポインタを動かすだけ）
+
+【12-4. TCP送信の流れ】
+
+  tcp_sendmsg():
+    [1] ユーザーデータを sk_buff にコピー
+    [2] sk_write_queue に追加
+    [3] tcp_push_one() / tcp_write_xmit() で送信可能なら送出
+
+  tcp_write_xmit():
+    [1] 輻輳ウィンドウ（cwnd）と受信ウィンドウ（rwnd）の小さい方が送信制限
+    [2] セグメント化（MSS: Maximum Segment Size でスライス）
+    [3] TCPヘッダを skb に付加
+    [4] ip_queue_xmit() へ渡す
+
+  ip_queue_xmit():
+    [1] ルーティングテーブルを検索してネクストホップを決定
+    [2] IPヘッダを付加（ソースIP, 宛先IP, TTL, プロトコル等）
+    [3] フラグメンテーション（MTUを超える場合）
+    [4] dev_queue_xmit() へ渡す
+
+  dev_queue_xmit():
+    [1] Qdisc（queueing discipline, TBF/HTBなどのQoS）を通す
+    [2] NICドライバの ndo_start_xmit() を呼んでハードウェアに渡す
+
+【12-5. TCP受信の流れ】
+
+  NICがパケットを受信:
+    [1] DMAでメモリに転送
+    [2] 割り込み発生（または NAPI ポーリング）
+    [3] netif_receive_skb() でスタックに上げる
+
+  ip_rcv():
+    [1] IPヘッダの検証（チェックサム、バージョン、TTL）
+    [2] ルーティング（自分宛かフォワードか）
+    [3] tcp_v4_rcv() または udp_rcv() へ
+
+  tcp_v4_rcv():
+    [1] TCPヘッダの検証
+    [2] ポート番号から struct sock を特定（ハッシュテーブルで検索）
+    [3] tcp_rcv_established()（既存接続）or tcp_rcv_state_process()（新接続等）
+    [4] ACK処理、ウィンドウ更新
+    [5] データを sk_receive_queue に追加
+
+  recv() の wake-up:
+    [1] sk_data_ready() を呼んで受信キューにデータが来たことを通知
+    [2] sock でブロックしていたプロセスを wake_up
+
+================================================================================
+第13章  ユーザー空間との境界・セキュリティ
+================================================================================
+
+【13-1. 特権とケイパビリティ】
+
+  伝統的な UNIX: root（UID=0）は何でもできる、それ以外は制限される
+  Linux ケイパビリティ: root の権限を細分化して個別に付与できる
+
+  主なケイパビリティ:
+    CAP_SYS_ADMIN  : ほとんどの管理操作
+    CAP_NET_ADMIN  : ネットワーク設定
+    CAP_CHOWN      : ファイル所有者変更
+    CAP_SETUID     : UID 変更
+    CAP_DAC_OVERRIDE: ファイルパーミッション無視
+    CAP_SYS_PTRACE : プロセスをデバッグ（ptrace）
+
+  ケイパビリティチェック:
+    capable(CAP_NET_ADMIN) → current->cap_effective でビットを確認
+
+【13-2. アクセス制御（DAC）】
+
+  UNIX パーミッション（rwx × owner/group/other）のチェック:
+    inode_permission() の動作:
+    [1] inode->i_mode からパーミッションビットを取得
+    [2] current->fsuid と inode->i_uid を比較（所有者チェック）
+    [3] current のグループリストと inode->i_gid を比較（グループチェック）
+    [4] その他ユーザーのビットを確認
+    [5] CAP_DAC_OVERRIDE があれば全許可
+
+【13-3. プロセス間のメモリ保護】
+
+  各プロセスは独立した仮想アドレス空間（独立したPML4テーブル）を持つ。
+  CPUがユーザー空間のコードを実行中（CS.CPL=3）は他プロセスのメモリにアクセス不可。
+  カーネル空間のアドレスにもアクセス不可（U/Sビットで制御）。
+
+  SMEP（Supervisor Mode Execution Prevention）:
+    CR4.SMEP = 1 のとき、カーネルモードでユーザー空間のコードを実行するとフォルト
+    → ret2usr 攻撃を防ぐ
+
+  SMAP（Supervisor Mode Access Prevention）:
+    CR4.SMAP = 1 のとき、カーネルがユーザー空間のデータに直接アクセスするとフォルト
+    → copy_to_user/copy_from_user は STAC/CLAC 命令でSMAPを一時解除して使う
+
+  KASLR（Kernel Address Space Layout Randomization）:
+    カーネルのロードアドレスをランダム化（起動時に決定）
+    → アドレスリークなしにROP等の攻撃が難しくなる
+
+【13-4. システムコールフィルタリング（seccomp）】
+
+  seccomp（secure computing mode）:
+    プロセスが使えるシステムコールを制限する仕組み
+    BPFプログラムでシステムコール番号と引数をフィルタリング
+
+  seccomp-bpf の動作:
+    [1] プロセスが prctl(PR_SET_SECCOMP, ...) でBPFフィルタをロード
+    [2] 以降のシステムコール呼び出し時にBPFプログラムが実行される
+    [3] SECCOMP_RET_ALLOW → 許可
+        SECCOMP_RET_KILL  → プロセスを即座に強制終了
+        SECCOMP_RET_TRAP  → SIGSYSを送信
+
+【13-5. カーネルのロック機構】
+
+  スピンロック（spinlock）:
+    → CPUをビジーウェイト（ループで待つ）
+    → 割り込みコンテキスト等、スリープできない場所で使う
+    → 保持時間が短い場合に向く
+    → SMP で安全（atomic なテスト&セット命令で実装）
+
+    spin_lock(&lock):   // lock が取れるまでCPUを回し続ける
+    spin_unlock(&lock): // lock を解放
+
+  ミューテックス（mutex）:
+    → 取れない場合はプロセスをスリープ
+    → プロセスコンテキストでのみ使える（割り込みハンドラ不可）
+    → 長時間保持するリソースに向く
+
+    mutex_lock(&m):   // 取れなければ TASK_UNINTERRUPTIBLE でスリープ
+    mutex_unlock(&m): // 解放して待ちプロセスを wake_up
+
+  RCU（Read-Copy-Update）:
+    → 読み取りを非常に軽量にする（ほぼコストゼロ）
+    → 書き込みはコピーを作って更新し、全読み取りが終わったら古いデータを解放
+    → ルーティングテーブル、ネットワーク接続テーブル等の多読み少書き構造に使う
+
+    rcu_read_lock():    // プリエンプションを無効化するだけ（実コストなし）
+    rcu_read_unlock():
+    synchronize_rcu():  // 全CPUの読み取りグレースピリオドが終わるのを待つ
+
+  アトミック操作:
+    atomic_t は整数をアトミックに操作できる型
+    atomic_inc(&v):        // ++v をアトミックに
+    atomic_dec_and_test(&v): // --v してゼロになったら true
+    → LOCK プレフィックス付きの x86 命令（LOCK XADD等）で実装
+
+================================================================================
+付録A  開発環境のセットアップ
+================================================================================
+
+  最小限の開発環境:
+    [1] クロスコンパイラ: x86_64-elf-gcc（または通常の gcc）
+    [2] アセンブラ: nasm または gas（GNU as）
+    [3] リンカスクリプト: カーネルのメモリレイアウトを定義
+    [4] QEMU: qemu-system-x86_64 でエミュレーション
+    [5] GDB + QEMU のリモートデバッグ（-s -S オプション）
+
+  最小カーネルのビルド手順例:
+    $ x86_64-elf-gcc -ffreestanding -nostdlib -mno-red-zone \
+        -mcmodel=kernel -c kernel.c -o kernel.o
+    $ x86_64-elf-ld -T linker.ld kernel.o -o kernel.elf
+    $ objcopy -O binary kernel.elf kernel.bin
+
+  リンカスクリプト最小例（linker.ld）:
+    ENTRY(_start)
+    SECTIONS {
+        . = 0xFFFFFFFF80000000;    /* カーネルの仮想アドレス */
+        .text   : { *(.text)   }
+        .rodata : { *(.rodata) }
+        .data   : { *(.data)   }
+        .bss    : { *(.bss)    }
+    }
+
+  QEMU での起動:
+    $ qemu-system-x86_64 -kernel kernel.elf -nographic \
+        -serial mon:stdio -m 512M
+
+================================================================================
+付録B  参考にすべき既存実装とドキュメント
+================================================================================
+
+  Linux カーネルソース（最重要）:
+    https://kernel.org
+    arch/x86/ : x86固有コード
+    mm/       : メモリ管理
+    kernel/   : プロセス・スケジューラ・シグナル
+    fs/       : ファイルシステム
+    net/      : ネットワーク
+    drivers/  : デバイスドライバ
+
+  教育目的のミニカーネル実装:
+    xv6 （MIT 6.828): https://github.com/mit-pdos/xv6-riscv
+      → Unix v6 を現代的に再実装。コードが読みやすい
+    OSDev Wiki: https://wiki.osdev.org
+      → ブート・割り込み・ページングの実装例が豊富
+
+  書籍:
+    "Lions' Commentary on UNIX 6th Edition" - John Lions
+    "The Design of the UNIX Operating System" - Maurice J. Bach
+    "Understanding the Linux Kernel" - Bovet & Cesati
+    "Linux Kernel Development" - Robert Love
+
+================================================================================
+付録C  実装順序の推奨ロードマップ
+================================================================================
+
+  Phase 1: ハードウェア制御基礎
+    [ ] ブートローダ（Multiboot対応）
+    [ ] GDT設定・プロテクトモード/ロングモード移行
+    [ ] IDT設定・基本例外ハンドラ
+    [ ] シリアル出力（デバッグ用：UARTポート0x3F8）
+    [ ] VGA テキストモード出力（ポート 0xB8000 への書き込み）
+
+  Phase 2: メモリ管理
+    [ ] 物理メモリマップ解析（e820）
+    [ ] 物理ページフレームアロケータ（ビットマップから始めてバディへ）
+    [ ] ページテーブル操作（map/unmap/flush）
+    [ ] カーネルヒープ（kmalloc/kfree：まずはシンプルなリストアロケータ）
+
+  Phase 3: 割り込み・タイマー
+    [ ] PIC 8259A 初期化
+    [ ] PIT タイマー割り込み（IRQ0）
+    [ ] キーボード割り込み（IRQ1）
+
+  Phase 4: プロセス管理
+    [ ] task_struct とカーネルスタック管理
+    [ ] 初期プロセス生成（最初のプロセスはカーネルが直接作る）
+    [ ] コンテキストスイッチ（アセンブリで書く）
+    [ ] ラウンドロビンスケジューラ（まずシンプルに）
+
+  Phase 5: システムコール
+    [ ] SYSCALL/SYSRET 設定
+    [ ] システムコールエントリポイント（アセンブリ）
+    [ ] 基本システムコール（exit, write, getpid）
+
+  Phase 6: ユーザー空間
+    [ ] ユーザー空間プロセスの作成（別のページテーブル、リング3への切り替え）
+    [ ] ELFローダ（静的リンク実行可能ファイルのみまず対応）
+    [ ] fork / exec 実装
+    [ ] wait / waitpid
+
+  Phase 7: ファイルシステム
+    [ ] VFS インターフェース設計
+    [ ] ramfs / tmpfs（メモリ上の単純なFS）
+    [ ] ファイルディスクリプタ管理（open/close/read/write）
+    [ ] ATA/IDE ドライバ（ポート I/O ベース）
+    [ ] ext2 読み込み対応
+
+  Phase 8: IPC・シグナル
+    [ ] パイプ
+    [ ] シグナル送受信（kill, sigaction, sigreturn）
+    [ ] 基本的なソケット（AF_UNIX）
+
+================================================================================
+END OF DOCUMENT
+UNIX DEV
+文字数目安: 約 25,000字
+================================================================================
